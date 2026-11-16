@@ -1,0 +1,12 @@
+pluginManagement {
+    repositories {
+        maven {
+            name = 'Fabric'
+            url = 'https://maven.fabricmc.net/'
+        }
+        maven { url = 'https://maven-central.storage-download.googleapis.com/maven2/' } // Maven Central (mirror)
+        gradlePluginPortal()
+    }
+}
+
+rootProject.name = 'wayfarers-atlas-fabric'

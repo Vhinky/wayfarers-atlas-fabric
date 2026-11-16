@@ -1,0 +1,793 @@
+package com.wayfarersatlas;
+
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.color.block.BlockColors;
+import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.QuartPos;
+import net.minecraft.util.Mth;
+import net.minecraft.world.level.BlockAndTintGetter;
+import net.minecraft.tags.BlockTags;
+import net.minecraft.tags.FluidTags;
+import net.minecraft.world.level.LightLayer;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.LiquidBlock;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.chunk.LevelChunk;
+import net.minecraft.world.level.levelgen.Heightmap;
+import net.minecraft.world.level.material.FluidState;
+import net.minecraft.world.level.material.Fluids;
+import net.minecraft.world.level.material.MapColor;
+
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
+
+/**
+ * Builds the map from loaded chunks. Colours come from block textures (with the game's own biome tint, so every
+ * Biomes O' Plenty / modded biome keeps its colours), lit from the north-west. Underground the map switches to a
+ * cave slice at the player's height, like Xaero's cave mode.
+ */
+public final class MapScanner {
+    private static final int DEFAULT_WATER = 0x3F76E4;
+    private static final int LAVA = 0xD2682C;
+    private static final int NEAR = 13;
+    public static final int LAYER = 6; // cave slice height
+
+    private static final List<int[]> OFFSETS = new ArrayList<>();
+    private static int builtRadius = -1;
+    private static int nearCursor = 0, farCursor = 0, oldCursor = 0;
+
+    public enum CaveMode { AUTO, OFF, MANUAL }
+
+    private static CaveMode mode = CaveMode.AUTO;
+    private static int manualY = 0;
+    private static boolean cave = false;
+    private static int caveLayer = 0;
+    private static int underCount = 0, surfCount = 0;
+
+    public static boolean isCave() {
+        return cave;
+    }
+
+    public static CaveMode mode() {
+        return mode;
+    }
+
+    public static int manualY() {
+        return manualY;
+    }
+
+    public static void setManualY(int y) {
+        Minecraft mc = Minecraft.getInstance();
+        String before = mc.level == null ? null : viewKey(mc.level);
+        manualY = y;
+        // the slider shows only what was really mapped in that slice: nothing is borrowed from another slice (a copy
+        // would stay there, wrong, until you go down there), and copies made before are dropped
+        if (before != null) MapCache.dropBorrowed(viewKey(mc.level));
+    }
+
+    /**
+     * Top of the roof of worlds with a ceiling (the Nether: 128). Everything above it is one cave slice - the roof -
+     * so the map shows the roof (and what was built on it) at any height above, not the caves below.
+     */
+    private static final java.util.Map<String, Integer> ROOF = new java.util.HashMap<>(java.util.Map.of("minecraft:the_nether", 128));
+
+    /** Key of the cave slice at height y of a world. */
+    public static String sliceKey(String dim, int y) {
+        int s = Math.floorDiv(y, LAYER);
+        Integer roof = ROOF.get(dim);
+        if (roof != null) s = Math.min(s, Math.floorDiv(roof + 2, LAYER));
+        return dim + "#c" + s;
+    }
+
+    /** Sets the cave view mode (used for the configured start mode). */
+    public static void setMode(CaveMode m, LocalPlayer p) {
+        while (mode != m) cycleMode(p);
+    }
+
+    /** AUTO -> OFF -> MANUAL -> AUTO. */
+    public static void cycleMode(LocalPlayer p) {
+        CaveMode old = mode;
+        mode = switch (mode) {
+            case AUTO -> CaveMode.OFF;
+            case OFF -> ServerRules.manualCaves() ? CaveMode.MANUAL : CaveMode.AUTO; // the server may forbid it
+            case MANUAL -> CaveMode.AUTO;
+        };
+        if (mode == CaveMode.MANUAL) manualY = p.getBlockY();
+        if (old == CaveMode.MANUAL) MapCache.dropManual();
+        underCount = 0;
+        surfCount = 0;
+        if (mode == CaveMode.AUTO) cave = false; // the timers decide again
+    }
+
+    public static String dimId(ClientLevel level) {
+        return level.dimension().location().toString();
+    }
+
+    /** Key of the layer that is currently shown: the dimension, or dimension + cave slice. */
+    public static String viewKey(ClientLevel level) {
+        String d = dimId(level);
+        if (!cave) return d;
+        // manual mode browses the same cave slices the automatic mode mapped (only caves you have been in)
+        return sliceKey(d, mode == CaveMode.MANUAL ? manualY : caveLayer * LAYER);
+    }
+
+    /** The height the cave slice is taken at: the player's height, or the slider value in manual mode. */
+    private static int sliceY(LocalPlayer p) {
+        return mode == CaveMode.MANUAL ? manualY : p.getBlockY();
+    }
+
+    /**
+     * Automatic cave mode. Underground = no daylight at the player's head AND natural ground (stone, deepslate,
+     * dirt, sand...) somewhere above. Leaves, wood and roofs do not count, so standing under a tree or in a house
+     * keeps the surface map. Cave mode switches on after ~1.5 s underground and off after ~0.2 s outside.
+     */
+    public static void updateCave(ClientLevel level, LocalPlayer p) {
+        String before = viewKey(level);
+        updateCave0(level, p);
+        String after = viewKey(level);
+        String roof = ROOF.containsKey(dimId(level)) ? sliceKey(dimId(level), 1 << 20) : null; // the roof is not like the caves under it
+        if (mode != CaveMode.MANUAL && !before.equals(after) && before.contains("#") && after.contains("#")
+                && !before.equals(roof) && !after.equals(roof)) { // to another cave slice
+            MapCache.borrow(before, after, p.chunkPosition().x, p.chunkPosition().z, 24);
+        }
+    }
+
+    private static void updateCave0(ClientLevel level, LocalPlayer p) {
+        if (mode == CaveMode.MANUAL && !ServerRules.manualCaves()) { // the server forbids it
+            mode = CaveMode.AUTO;
+            cave = false;
+        }
+        boolean ceiling = level.dimensionType().hasCeiling();
+        if (ceiling) ROOF.putIfAbsent(dimId(level), level.getMinBuildHeight() + level.dimensionType().logicalHeight());
+        // in or below the bedrock floor (void): nothing to map there - show the surface instead (not in manual mode)
+        if (!ceiling && mode != CaveMode.MANUAL && p.getBlockY() < level.getMinBuildHeight() + 5) {
+            cave = false;
+            underCount = 0;
+            surfCount = 0;
+            caveLayer = Math.floorDiv(p.getBlockY(), LAYER);
+            return;
+        }
+        if (mode == CaveMode.MANUAL || ceiling) {
+            cave = true;
+        } else if (mode == CaveMode.OFF) {
+            cave = false;
+        } else {
+            // checked every tick: going underground needs ~1.5 s, coming back to the surface only ~0.2 s
+            if (covered(level, p)) {
+                underCount++;
+                surfCount = 0;
+            } else {
+                surfCount++;
+                underCount = 0;
+            }
+            if (!cave && underCount >= 30) cave = true;
+            else if (cave && surfCount >= 4) cave = false;
+        }
+        caveLayer = Math.floorDiv(p.getBlockY(), LAYER);
+        String k = viewKey(level);
+        if (!k.contains("#m")) LAST_KEY.put(dimId(level), k);
+    }
+
+    private static final java.util.Map<String, String> LAST_KEY = new java.util.HashMap<>();
+
+    /**
+     * Layer to show for a dimension you are not in: its surface map, or (worlds with a ceiling like the Nether)
+     * the cave slice you saw there last, or the biggest one.
+     */
+    public static String keyFor(String dim) {
+        var surface = MapCache.chunks(dim);
+        if (surface != null && !surface.isEmpty()) return dim;
+        String last = LAST_KEY.get(dim);
+        if (last != null && MapCache.chunks(last) != null) return last;
+        String best = dim;
+        int most = 0;
+        for (String k : MapCache.keys()) {
+            if (!k.startsWith(dim + "#") || k.contains("#m")) continue;
+            var m = MapCache.chunks(k);
+            if (m != null && m.size() > most) {
+                most = m.size();
+                best = k;
+            }
+        }
+        return best;
+    }
+
+    private static boolean covered(ClientLevel level, LocalPlayer p) {
+        BlockPos head = BlockPos.containing(p.getX(), p.getEyeY(), p.getZ());
+        if (level.getBrightness(LightLayer.SKY, head) > 0) return false; // daylight reaches the player: surface
+        int bx = head.getX(), bz = head.getZ();
+        if (!level.hasChunk(bx >> 4, bz >> 4)) return false;
+        int top = level.getHeight(Heightmap.Types.WORLD_SURFACE, bx, bz);
+        BlockPos.MutableBlockPos m = new BlockPos.MutableBlockPos();
+        for (int y = head.getY() + 1; y <= top; y++) {
+            if (isGround(level.getBlockState(m.set(bx, y, bz)))) return true;
+        }
+        return false;
+    }
+
+    private static boolean isGround(BlockState st) {
+        return st.is(BlockTags.BASE_STONE_OVERWORLD) || st.is(BlockTags.DEEPSLATE_ORE_REPLACEABLES)
+                || st.is(BlockTags.DIRT) || st.is(BlockTags.SAND) || st.is(BlockTags.TERRACOTTA)
+                || st.is(Blocks.GRAVEL);
+    }
+
+    private static void build(int r) {
+        OFFSETS.clear();
+        for (int dx = -r; dx <= r; dx++) {
+            for (int dz = -r; dz <= r; dz++) {
+                if (dx * dx + dz * dz <= (r + 1) * (r + 1)) OFFSETS.add(new int[]{dx, dz}); // chunks that are not loaded are skipped
+            }
+        }
+        OFFSETS.sort(Comparator.comparingInt(o -> o[0] * o[0] + o[1] * o[1]));
+        builtRadius = r;
+        nearCursor = 0;
+        farCursor = 0;
+    }
+
+    /** Called every client tick; spends at most ~2.5 ms scanning chunks. */
+    public static void tick(ClientLevel level, LocalPlayer player, int radius) {
+        if (radius != builtRadius) build(radius);
+        // No x-ray: in manual cave mode new cave land is mapped only when you are really down there, in that slice
+        // and under the ground; otherwise manual mode just shows what was mapped before.
+        if (cave && mode == CaveMode.MANUAL && (!sliceKey(dimId(level), manualY).equals(sliceKey(dimId(level), player.getBlockY()))
+                || !(level.dimensionType().hasCeiling() || covered(level, player)))) return;
+        String key = viewKey(level);
+        int pcx = player.chunkPosition().x;
+        int pcz = player.chunkPosition().z;
+        long deadline = System.nanoTime() + 3_000_000L; // at most 3 ms per tick
+
+        int[] near = OFFSETS.get(nearCursor++ % Math.min(NEAR, OFFSETS.size()));
+        scanOffset(level, player, key, pcx + near[0], pcz + near[1]);
+
+        int scanned = 0;
+        // new (and only-seen-on-a-table) chunks first, always the nearest ones first: after a teleport the land round
+        // you appears first and the map grows outwards from there
+        for (int i = 0; i < OFFSETS.size() && scanned < 24 && System.nanoTime() < deadline; i++) {
+            int[] o = OFFSETS.get(i);
+            if (MapCache.hasOwn(key, pcx + o[0], pcz + o[1])) continue;
+            if (scanOffset(level, player, key, pcx + o[0], pcz + o[1])) scanned++;
+        }
+        if (scanned == 0) { // nothing new: redraw chunks mapped in earlier sessions (new relief, changed land)
+            for (int i = 0; i < OFFSETS.size() && scanned < 6 && System.nanoTime() < deadline; i++) {
+                int[] o = OFFSETS.get(oldCursor++ % OFFSETS.size());
+                if (MapCache.isFresh(key, pcx + o[0], pcz + o[1])) continue;
+                if (scanOffset(level, player, key, pcx + o[0], pcz + o[1])) scanned++;
+            }
+        }
+        if (scanned == 0) { // everything known: slowly refresh one far chunk per tick
+            int[] o = OFFSETS.get(farCursor++ % OFFSETS.size());
+            scanOffset(level, player, key, pcx + o[0], pcz + o[1]);
+        }
+    }
+
+    /** A chunk is only scanned once all eight neighbours are loaded, so the relief has no seams. */
+    private static boolean scanOffset(ClientLevel level, LocalPlayer player, String key, int cx, int cz) {
+        var src = level.getChunkSource();
+        LevelChunk c = src.getChunkNow(cx, cz);
+        if (c == null) return false;
+        LevelChunk n = src.getChunkNow(cx, cz - 1), s = src.getChunkNow(cx, cz + 1);
+        LevelChunk w = src.getChunkNow(cx - 1, cz), e = src.getChunkNow(cx + 1, cz);
+        LevelChunk nw = src.getChunkNow(cx - 1, cz - 1), ne = src.getChunkNow(cx + 1, cz - 1);
+        LevelChunk sw = src.getChunkNow(cx - 1, cz + 1), se = src.getChunkNow(cx + 1, cz + 1);
+        if (n == null || s == null || w == null || e == null || nw == null || ne == null || sw == null || se == null) return false;
+        int[][] r = scanChunk(level, level.getSeaLevel(), c, n, s, w, e, nw, ne, sw, se, cave, sliceY(player));
+        MapCache.put(key, cx, cz, r[0], r[1], r[2], r[3]);
+        return true;
+    }
+
+    private static final class Col {
+        int y;
+        double shadeH; // height used for relief: trees and plants count only a little, so the ground shape shows
+        double groundH; // the ground itself (under tree crowns): the shape of the land for slopes and shadows
+        boolean tree;   // leaves or a log on top
+        int crown;      // tree: how many blocks of leaves from the top down (the crown)
+        boolean trunk;  // tree: a log stands under the crown in this column
+        BlockState state;
+        boolean lily;
+        boolean rock;
+    }
+
+    private static void top(net.minecraft.world.level.BlockGetter level, LevelChunk chunk, int lx, int lz, boolean cave, int start,
+                            int minY, BlockPos.MutableBlockPos pos, Col out) {
+        int baseX = chunk.getPos().getMinBlockX(), baseZ = chunk.getPos().getMinBlockZ();
+        int y = cave ? start : chunk.getHeight(Heightmap.Types.WORLD_SURFACE, lx, lz); // Y of the top block
+        out.state = null;
+        out.lily = false;
+        out.rock = false;
+        out.tree = false;
+        out.crown = 0;
+        out.trunk = false;
+        out.y = minY;
+        out.shadeH = minY;
+        out.groundH = minY;
+        boolean first = true;
+        if (cave) {
+            // Like Xaero's cave mode: from the slice height go down through solid rock until a cave opens, then show
+            // its floor. So caves a little below show too and the whole network can be followed. No cave within
+            // reach = solid rock.
+            int top = y;
+            while (y > minY && top - y < CAVE_REACH) {
+                pos.set(baseX + lx, y, baseZ + lz);
+                if (chunk.getBlockState(pos).getMapColor(level, pos) == MapColor.NONE) break; // air: a cave
+                y--;
+            }
+            if (y <= minY || top - y >= CAVE_REACH) { // solid all the way down
+                pos.set(baseX + lx, top, baseZ + lz);
+                out.state = chunk.getBlockState(pos);
+                out.y = top;
+                out.shadeH = top;
+                out.groundH = top;
+                out.rock = true;
+                return;
+            }
+            first = false;
+        }
+        while (y > minY) {
+            pos.set(baseX + lx, y, baseZ + lz);
+            BlockState st = chunk.getBlockState(pos);
+            if (st.is(Blocks.LILY_PAD)) {
+                out.lily = true;
+                first = false;
+                y--;
+                continue;
+            }
+            if (st.getMapColor(level, pos) != MapColor.NONE) {
+                out.y = y;
+                out.state = st;
+                out.rock = cave && first;
+                out.shadeH = y;
+                out.groundH = y;
+                out.tree = !cave && (isLeaves(st) || isLog(st));
+                if (out.tree) { // look through the tree down to the ground: how thick the crown is, is there a trunk
+                    boolean crown = !isLog(st);
+                    out.crown = crown ? 1 : 0;
+                    out.trunk = !crown;
+                    int gy = y - 1;
+                    while (gy > minY && y - gy < 40) {
+                        pos.set(baseX + lx, gy, baseZ + lz);
+                        BlockState b = chunk.getBlockState(pos);
+                        boolean log = isLog(b);
+                        if (log) out.trunk = true;
+                        if (crown && !log && !isLeaves(b)) crown = false;
+                        else if (crown && !log) out.crown++;
+                        else crown = false;
+                        if (!isFoliage(b) && !b.isAir() && b.getMapColor(level, pos) != MapColor.NONE) break;
+                        gy--;
+                    }
+                    out.groundH = gy;
+                }
+                if (!cave && isFoliage(st) && !isLeaves(st) && !isLog(st)) { // grass, flowers: use the ground
+                    int gy = y - 1;
+                    while (gy > minY && y - gy < 24) {
+                        pos.set(baseX + lx, gy, baseZ + lz);
+                        BlockState b = chunk.getBlockState(pos);
+                        if (!isFoliage(b) && !b.isAir() && b.getMapColor(level, pos) != MapColor.NONE) break;
+                        gy--;
+                    }
+                    out.shadeH = gy + Math.min(y - gy, 3);
+                    out.groundH = gy;
+                }
+                return;
+            }
+            first = false;
+            y--;
+        }
+    }
+
+    /** Leaves, also of mods that do not tag theirs (they nearly always are a LeavesBlock). */
+    private static boolean isLeaves(BlockState st) {
+        return st.is(BlockTags.LEAVES) || st.getBlock() instanceof net.minecraft.world.level.block.LeavesBlock;
+    }
+
+    /** Logs and stems, also of mods that do not tag theirs (a pillar block named ..._log / _wood / _stem). */
+    private static boolean isLog(BlockState st) {
+        if (st.is(BlockTags.LOGS)) return true;
+        if (!(st.getBlock() instanceof net.minecraft.world.level.block.RotatedPillarBlock)) return false;
+        Boolean known = LOGS.get(st.getBlock());
+        if (known == null) {
+            String path = net.minecraft.core.registries.BuiltInRegistries.BLOCK.getKey(st.getBlock()).getPath();
+            known = path.endsWith("_log") || path.endsWith("_wood") || path.endsWith("_stem") || path.endsWith("_hyphae");
+            LOGS.put(st.getBlock(), known);
+        }
+        return known;
+    }
+
+    private static final java.util.Map<net.minecraft.world.level.block.Block, Boolean> LOGS = new java.util.IdentityHashMap<>();
+
+    private static boolean isFoliage(BlockState st) {
+        return isLeaves(st) || isLog(st) || st.is(BlockTags.REPLACEABLE_BY_TREES)
+                || st.is(BlockTags.FLOWERS) || st.is(BlockTags.SAPLINGS) || st.is(Blocks.BAMBOO) || st.is(Blocks.VINE);
+    }
+
+    /**
+     * The surface map of a chunk the server sent for "/atlas reveal" (it is not loaded in the world). world = where
+     * the blocks and biome colours of it and its neighbours are read from; nine = the chunk and its eight neighbours
+     * (nw, n, ne, w, itself, e, sw, s, se).
+     */
+    public static int[][] scanRevealed(BlockAndTintGetter world, int seaLevel, LevelChunk[] nine) {
+        return scanChunk(world, seaLevel, nine[4], nine[1], nine[7], nine[3], nine[5], nine[0], nine[2], nine[6], nine[8], false, 0);
+    }
+
+    private static int[][] scanChunk(BlockAndTintGetter level, int seaLevel, LevelChunk c, LevelChunk n, LevelChunk s, LevelChunk w,
+                                     LevelChunk e, LevelChunk nw, LevelChunk ne, LevelChunk sw, LevelChunk se,
+                                     boolean cave, int playerY) {
+        BlockColors bc = Minecraft.getInstance().getBlockColors();
+        int minY = level.getMinBuildHeight();
+        int maxY = level.getMaxBuildHeight() - 1;
+        int start = Math.min(playerY + 2, maxY);
+        int baseX = c.getPos().getMinBlockX(), baseZ = c.getPos().getMinBlockZ();
+        BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
+        TINTS.clear(); // smooth biome colours are worked out per chunk
+        tintQx0 = (baseX >> 2) - 2;
+        tintQz0 = (baseZ >> 2) - 2;
+
+        Col[] cols = new Col[256];
+        double[] hg = new double[G * G]; // relief heights with a 3-block border from the neighbouring chunks
+        double[] tg = new double[G * G]; // ground heights (under trees), same grid
+        boolean[] rg = new boolean[G * G]; // cave view: solid rock at the slice, same grid
+        for (int lz = 0; lz < 16; lz++) {
+            for (int lx = 0; lx < 16; lx++) {
+                Col col = new Col();
+                top(level, c, lx, lz, cave, start, minY, pos, col);
+                cols[(lz << 4) | lx] = col;
+                hg[(lz + B) * G + lx + B] = col.shadeH;
+                tg[(lz + B) * G + lx + B] = col.groundH;
+                rg[(lz + B) * G + lx + B] = col.rock;
+            }
+        }
+        LevelChunk[] nine = {nw, n, ne, w, c, e, sw, s, se};
+        Col tmp = new Col();
+        for (int gz = 0; gz < G; gz++) {
+            for (int gx = 0; gx < G; gx++) {
+                int lx = gx - B, lz = gz - B;
+                if (lx >= 0 && lx < 16 && lz >= 0 && lz < 16) continue;
+                int ci = lx < 0 ? 0 : lx > 15 ? 2 : 1, cj = lz < 0 ? 0 : lz > 15 ? 2 : 1;
+                LevelChunk nb = nine[cj * 3 + ci];
+                if (nb == null) { // not known (edge of land the server showed): the nearest column of this chunk
+                    top(level, c, Math.max(0, Math.min(15, lx)), Math.max(0, Math.min(15, lz)), cave, start, minY, pos, tmp);
+                } else {
+                    top(level, nb, lx & 15, lz & 15, cave, start, minY, pos, tmp);
+                }
+                hg[gz * G + gx] = tmp.shadeH;
+                tg[gz * G + gx] = tmp.groundH;
+                rg[gz * G + gx] = tmp.rock;
+            }
+        }
+
+        int[] colors = new int[256];
+        int[] heights = new int[256];
+        for (int lz = 0; lz < 16; lz++) {
+            for (int lx = 0; lx < 16; lx++) {
+                int idx = (lz << 4) | lx;
+                Col col = cols[idx];
+                if (col.state == null) {
+                    colors[idx] = 0;
+                    heights[idx] = Integer.MIN_VALUE;
+                    continue;
+                }
+                int kind = col.tree ? Heights.TREE : Heights.LAND, wdepth = 0;
+                pos.set(baseX + lx, col.y, baseZ + lz);
+                BlockState st = col.state;
+                MapColor mc = st.getMapColor(level, pos);
+
+                double shade = col.tree ? treeRelief(hg, lx + B, lz + B)
+                        : relief(hg, tg, lx + B, lz + B, cave ? Integer.MIN_VALUE : seaLevel);
+
+                int rgb;
+                FluidState fs = st.getFluidState();
+                boolean modFluid = !fs.isEmpty() && st.getBlock() instanceof LiquidBlock
+                        && !fs.getType().isSame(Fluids.WATER) && !fs.getType().isSame(Fluids.LAVA);
+                if (modFluid) {
+                    // oil, fuel, acid... from mods: their own texture colour (many of them reuse water's map colour)
+                    int fc = BlockColorCache.fluid(fs, level, pos);
+                    if (fc < 0) fc = blockRgb(level, bc, st, pos);
+                    int depth = 1;
+                    for (int yy = col.y - 1; yy > minY && depth < 63; yy--) {
+                        pos.set(baseX + lx, yy, baseZ + lz);
+                        if (!c.getBlockState(pos).getFluidState().getType().isSame(fs.getType())) break;
+                        depth++;
+                    }
+                    pos.set(baseX + lx, col.y, baseZ + lz);
+                    rgb = scale(fc, clamp(1.06 - Math.min(depth, 16) * 0.03, 0.78, 1.06));
+                    shade = 1.0;
+                    kind = Heights.WATER;
+                    wdepth = depth;
+                } else if (mc == MapColor.WATER) {
+                    int depth = 1;
+                    int floorRgb = -1;
+                    int yy = col.y - 1;
+                    while (yy > minY && depth < 63) {
+                        pos.set(baseX + lx, yy, baseZ + lz);
+                        BlockState below = c.getBlockState(pos);
+                        if (below.getMapColor(level, pos) == MapColor.WATER) {
+                            depth++;
+                            yy--;
+                            continue;
+                        }
+                        floorRgb = blockRgb(level, bc, below, pos);
+                        break;
+                    }
+                    pos.set(baseX + lx, col.y, baseZ + lz);
+                    int tint = safeTint(bc, st, level, pos, 0);
+                    rgb = waterRgb(depth, floorRgb, tint == -1 ? DEFAULT_WATER : tint);
+                    if (col.lily) rgb = mix(rgb, 0x5F7C4A, 0.30);
+                    shade = 1.0;
+                    kind = Heights.WATER;
+                    wdepth = depth;
+                } else if (st.getFluidState().is(FluidTags.LAVA)) {
+                    rgb = LAVA;
+                    shade = 1.0;
+                    kind = Heights.LAVA;
+                    int depth = 1; // how deep the lava is (shown with the height under the map)
+                    for (int yy = col.y - 1; yy > minY && depth < 63; yy--) {
+                        pos.set(baseX + lx, yy, baseZ + lz);
+                        if (!c.getBlockState(pos).getFluidState().is(FluidTags.LAVA)) break;
+                        depth++;
+                    }
+                    pos.set(baseX + lx, col.y, baseZ + lz);
+                    wdepth = depth;
+                } else {
+                    rgb = blockRgb(level, bc, st, pos);
+                    if (!col.tree) {
+                        if (mc == MapColor.STONE || mc == MapColor.DEEPSLATE) kind = Heights.ROCK;
+                        else if (mc == MapColor.SNOW || mc == MapColor.ICE) kind = Heights.SNOW;
+                        else if (mc == MapColor.SAND) kind = Heights.SAND;
+                        else if (mc == MapColor.FIRE) kind = Heights.LAVA;
+                    }
+                }
+                heights[idx] = col.rock ? Integer.MIN_VALUE
+                        : col.tree ? Heights.packTree(col.y, (int) Math.round(col.y - col.groundH), col.crown, col.trunk)
+                        : Heights.pack(col.y, kind, wdepth, (int) Math.round(col.y - col.groundH));
+
+                if (cave) {
+                    int gi = (lz + B) * G + lx + B;
+                    boolean edge = rg[gi - 1] != col.rock || rg[gi + 1] != col.rock || rg[gi - G] != col.rock || rg[gi + G] != col.rock;
+                    if (col.rock) {
+                        // solid rock around the caves: one dark colour, like Xaero's cave mode, so no ores show
+                        // through; its edge along the cave a little lighter, so the passages stand out
+                        colors[idx] = toAbgr(edge ? CAVE_WALL : CAVE_ROCK);
+                        continue;
+                    }
+                    // the cave floor stays bright (only a little darker the deeper it lies), lit along the walls
+                    shade *= clamp(1.0 - (start - col.y) * 0.014, 0.5, 1.0); // deeper caves darker
+                    if (edge) shade *= 1.12;
+                }
+                colors[idx] = toAbgr(soften(scale(rgb, shade)));
+            }
+        }
+        // biome per 4x4 blocks, taken at the height that is shown (works for every biome mod)
+        int[] biomes = new int[16];
+        for (int qz = 0; qz < 4; qz++) {
+            for (int qx = 0; qx < 4; qx++) {
+                int lx = qx * 4 + 2, lz = qz * 4 + 2;
+                Col col = cols[(lz << 4) | lx];
+                int by = col.state == null ? start : Math.min(col.y + 1, maxY);
+                if (cave && col.rock) by = start;
+                try {
+                    biomes[(qz << 2) | qx] = BiomeNames.index(BiomeNames.idOf(c.getNoiseBiome(
+                            QuartPos.fromBlock(baseX + lx), QuartPos.fromBlock(by), QuartPos.fromBlock(baseZ + lz))));
+                } catch (RuntimeException ex) {
+                    biomes[(qz << 2) | qx] = 0;
+                }
+            }
+        }
+        // block light just above the shown block (torches, lanterns, lava, glowstone...) for the night view
+        int[] light = new int[256];
+        for (int lz = 0; lz < 16; lz++) {
+            for (int lx = 0; lx < 16; lx++) {
+                Col col = cols[(lz << 4) | lx];
+                if (col.state == null) continue;
+                pos.set(baseX + lx, Math.min(col.y + 1, maxY), baseZ + lz);
+                int bl = level.getBrightness(LightLayer.BLOCK, pos);
+                if (col.state.getLightEmission() > bl) {
+                    bl = col.state.getLightEmission(); // the shown block glows itself (lava, glowstone)
+                }
+                light[(lz << 4) | lx] = bl;
+            }
+        }
+        // the real blocks of the surface for the isometric view (not in the cave view)
+        return new int[][]{colors, heights, biomes, light};
+    }
+
+    /** Something you see through: open (see below) or leaves. */
+    private static boolean see(BlockAndTintGetter level, BlockState st, BlockPos pos) {
+        return isLeaves(st) || open(level, st, pos);
+    }
+
+    /** Air, plants and things you see through on a map (torches, glass panes...): not a block for the isometric view. */
+    private static boolean open(BlockAndTintGetter level, BlockState st, BlockPos pos) {
+        if (st.isAir()) return true;
+        if (st.getBlock() instanceof LiquidBlock) return false;
+        if (isFoliage(st) && !isLeaves(st) && !isLog(st)) return true;
+        return st.getMapColor(level, pos) == MapColor.NONE;
+    }
+
+    private static int abgrToRgb(int c) {
+        return ((c & 0xFF) << 16) | (c & 0xFF00) | ((c >> 16) & 0xFF);
+    }
+
+    private static final int CAVE_ROCK = 0x1E1A16, CAVE_WALL = 0x4A4036; // RGB: solid rock in the cave view, its edge
+    private static final int CAVE_REACH = 32; // cave view: how far below the slice caves are still shown
+    private static final int B = 3, G = 16 + 2 * B; // relief grid: the chunk plus 3 blocks all round
+
+    /**
+     * Relief like Xaero's map, so hills, slopes and cliffs show:
+     *  - slopes, lit from the north-west: the height difference across 5 blocks (north-west minus south-east). Whole
+     *    hillsides turning away from the light get clearly darker, those facing it lighter;
+     *  - every block compared with its north and west neighbours: each terrace step is a crisp line, and big steps
+     *    count more than small ones (square root), so a cliff stands out far more than a 1-block step;
+     *  - higher ground within 3 blocks to the north-west casts a shadow down a cliff (a band, not a 1-pixel line);
+     *  - high ground is a bit lighter than low ground.
+     * Tree crowns use their real leaf heights; grass and flowers use the ground. sea = sea level, or
+     * Integer.MIN_VALUE in cave view. The "Relief" setting scales all of it.
+     */
+    private static double relief(double[] hg, double[] tg, int x, int z, int sea) {
+        double c = hg[z * G + x], t = tg[z * G + x];
+        // slope of the land itself, trees left out (light from the north-west)
+        double nw = (tg[(z - 2) * G + x - 2] + tg[(z - 2) * G + x - 1] + tg[(z - 1) * G + x - 2]) / 3.0;
+        double se = (tg[(z + 2) * G + x + 2] + tg[(z + 2) * G + x + 1] + tg[(z + 1) * G + x + 2]) / 3.0;
+        double slope = (se - nw) / 4.0; // > 0: rising towards the south-east, faces the light
+        double shade = 1.0 + clamp(slope * 0.32, -0.40, 0.22);
+        // crisp steps (a tree next to the ground gives its neat little edge, capped)
+        double d = clamp(c - hg[(z - 1) * G + x], -4, 32) + clamp(c - hg[z * G + x - 1], -4, 32);
+        double step = Math.signum(d) * Math.sqrt(Math.min(Math.abs(d), 32)) * 0.07;
+        shade *= 1.0 + clamp(step, -0.30, 0.18);
+        // shadow below cliffs
+        double shadow = 0;
+        for (int k = 1; k <= 3; k++) shadow = Math.max(shadow, tg[(z - k) * G + x - k] - t - 2 * k); // cliffs, not trees
+        shade *= 1.0 - clamp(shadow * 0.04, 0, 0.30);
+        if (sea != Integer.MIN_VALUE) shade *= 1.0 + clamp((t - sea) / 120.0, -0.10, 0.14);
+        shade = 1.0 + (shade - 1.0) * AtlasConfig.RELIEF.get() / 100.0;
+        return clamp(shade, 0.40, 1.45);
+    }
+
+    /**
+     * Tree crowns keep the earlier, gentle relief: every leaf block compared with its north and west neighbours
+     * (capped at 3 blocks), so each crown gets its soft bumpy look without dark blotches or bright tops.
+     */
+    private static double treeRelief(double[] hg, int x, int z) {
+        double c = hg[z * G + x];
+        double dN = clamp(c - hg[(z - 1) * G + x], -3, 3);
+        double dW = clamp(c - hg[z * G + x - 1], -3, 3);
+        double shade = 1.0 + clamp((dN + dW) * 0.07, -0.24, 0.18);
+        shade = 1.0 + (shade - 1.0) * AtlasConfig.RELIEF.get() / 100.0;
+        return clamp(shade, 0.5, 1.45);
+    }
+
+    private static int rawTint(BlockColors bc, BlockState st, BlockAndTintGetter level, BlockPos pos, int index) {
+        try {
+            return bc.getColor(st, level, pos, index);
+        } catch (RuntimeException e) {
+            return -1;
+        }
+    }
+
+    // Biome colours (grass, leaves, water) change in steps of 4 blocks; with the game's "Biome Blend" off, or between
+    // some modded biomes, that shows as blocky squares on the map. So the tint is taken at the middle of every
+    // 4x4 cell around the chunk and blended smoothly in between - the map always looks blended.
+    private static final java.util.IdentityHashMap<BlockState, int[][]> TINTS = new java.util.IdentityHashMap<>();
+    private static int tintQx0, tintQz0;
+    private static final int TG = 8; // cells across: the chunk (4) plus 2 on every side
+
+    private static int safeTint(BlockColors bc, BlockState st, BlockAndTintGetter level, BlockPos pos, int index) {
+        if (index < 0 || index > 3) return rawTint(bc, st, level, pos, index);
+        int[][] perIndex = TINTS.computeIfAbsent(st, k -> new int[4][]);
+        int[] grid = perIndex[index];
+        if (grid == null) {
+            grid = new int[TG * TG];
+            BlockPos.MutableBlockPos p = new BlockPos.MutableBlockPos();
+            for (int gz = 0; gz < TG; gz++) {
+                for (int gx = 0; gx < TG; gx++) {
+                    p.set(((tintQx0 + gx) << 2) + 2, pos.getY(), ((tintQz0 + gz) << 2) + 2);
+                    int t = rawTint(bc, st, level, p, index);
+                    if (t == -1) { // this block has no biome colour: use it as it is
+                        grid = null;
+                        break;
+                    }
+                    grid[gz * TG + gx] = t;
+                }
+                if (grid == null) break;
+            }
+            if (grid == null) grid = new int[0];
+            perIndex[index] = grid;
+        }
+        if (grid.length == 0) return rawTint(bc, st, level, pos, index);
+        double fx = (pos.getX() - 2) / 4.0 - tintQx0, fz = (pos.getZ() - 2) / 4.0 - tintQz0;
+        int x0 = Mth.clamp((int) Math.floor(fx), 0, TG - 2), z0 = Mth.clamp((int) Math.floor(fz), 0, TG - 2);
+        double tx = Mth.clamp(fx - x0, 0, 1), tz = Mth.clamp(fz - z0, 0, 1);
+        int c00 = grid[z0 * TG + x0], c10 = grid[z0 * TG + x0 + 1], c01 = grid[(z0 + 1) * TG + x0], c11 = grid[(z0 + 1) * TG + x0 + 1];
+        int out = 0;
+        for (int sh = 0; sh <= 16; sh += 8) {
+            double a = ((c00 >> sh) & 0xFF) * (1 - tx) + ((c10 >> sh) & 0xFF) * tx;
+            double b = ((c01 >> sh) & 0xFF) * (1 - tx) + ((c11 >> sh) & 0xFF) * tx;
+            out |= ((int) Math.round(a * (1 - tz) + b * tz) & 0xFF) << sh;
+        }
+        return out;
+    }
+
+    /** Texture colour (biome-tinted where the block is tinted), or the vanilla map colour as a fallback. */
+    private static int blockRgb(BlockAndTintGetter level, BlockColors bc, BlockState st, BlockPos pos) {
+        BlockColorCache.Info info = BlockColorCache.get(st);
+        if (info.base() >= 0) {
+            int c = info.base();
+            if (info.tint() >= 0) {
+                int t = safeTint(bc, st, level, pos, info.tint());
+                if (t != -1) return scale(multiply(c, t), 1.30);
+            }
+            return scale(c, 1.06);
+        }
+        MapColor mc = st.getMapColor(level, pos);
+        int abgr = mc.calculateRGBColor(MapColor.Brightness.HIGH);
+        int rgb = ((abgr & 0xFF) << 16) | (abgr & 0xFF00) | ((abgr >> 16) & 0xFF);
+        int t = safeTint(bc, st, level, pos, 0);
+        return t != -1 ? scale(t, 0.95) : rgb;
+    }
+
+    /** Shallow water is light and takes the biome's water hue; deep water fades to a dark version of it. */
+    private static int waterRgb(int depth, int floorRgb, int tintRgb) {
+        double t = 1.0 - Math.exp(-depth / 9.0);
+        double tr = (tintRgb >> 16) & 0xFF, tg = (tintRgb >> 8) & 0xFF, tb = tintRgb & 0xFF;
+        double sr = lerp(tr, 0xA8, 0.35), sg = lerp(tg, 0xE8, 0.35), sb = lerp(tb, 0xF4, 0.35);
+        double r = lerp(sr, tr * 0.38, t), g = lerp(sg, tg * 0.38, t), b = lerp(sb, tb * 0.38, t);
+        if (floorRgb >= 0 && depth <= 5) {
+            double wt = (1.0 - depth / 6.0) * 0.45;
+            r = lerp(r, (floorRgb >> 16) & 0xFF, wt);
+            g = lerp(g, (floorRgb >> 8) & 0xFF, wt);
+            b = lerp(b, floorRgb & 0xFF, wt);
+        }
+        return ((int) r << 16) | ((int) g << 8) | (int) b;
+    }
+
+    /** Takes the edge off very saturated colours (lava, cherry leaves, ...) so the map looks calm, not neon. */
+    private static int soften(int rgb) {
+        double r = (rgb >> 16) & 0xFF, g = (rgb >> 8) & 0xFF, b = rgb & 0xFF;
+        double max = Math.max(r, Math.max(g, b)), min = Math.min(r, Math.min(g, b));
+        if (max <= 0 || max == min) return rgb;
+        double s = (max - min) / max;
+        if (s <= 0.55) return rgb; // ordinary colours stay as they are (crisp)
+        double s2 = s - (s - 0.55) * 0.55;
+        double v2 = max * (1.0 - 0.12 * (s - 0.55));
+        double min2 = v2 * (1.0 - s2);
+        double k = (v2 - min2) / (max - min);
+        return ((int) clamp(min2 + (r - min) * k, 0, 255) << 16)
+                | ((int) clamp(min2 + (g - min) * k, 0, 255) << 8)
+                | (int) clamp(min2 + (b - min) * k, 0, 255);
+    }
+
+    private static int multiply(int a, int b) {
+        int r = (((a >> 16) & 0xFF) * ((b >> 16) & 0xFF)) / 255;
+        int g = (((a >> 8) & 0xFF) * ((b >> 8) & 0xFF)) / 255;
+        int bl = ((a & 0xFF) * (b & 0xFF)) / 255;
+        return (r << 16) | (g << 8) | bl;
+    }
+
+    private static int scale(int rgb, double f) {
+        int r = (int) Math.min(255, ((rgb >> 16) & 0xFF) * f);
+        int g = (int) Math.min(255, ((rgb >> 8) & 0xFF) * f);
+        int b = (int) Math.min(255, (rgb & 0xFF) * f);
+        return (r << 16) | (g << 8) | b;
+    }
+
+    private static int mix(int a, int b, double t) {
+        return ((int) lerp((a >> 16) & 0xFF, (b >> 16) & 0xFF, t) << 16)
+                | ((int) lerp((a >> 8) & 0xFF, (b >> 8) & 0xFF, t) << 8)
+                | (int) lerp(a & 0xFF, b & 0xFF, t);
+    }
+
+    private static int toAbgr(int rgb) {
+        return 0xFF000000 | ((rgb & 0xFF) << 16) | (rgb & 0xFF00) | ((rgb >> 16) & 0xFF);
+    }
+
+    private static double lerp(double a, double b, double t) {
+        return a + (b - a) * t;
+    }
+
+    private static double clamp(double v, double lo, double hi) {
+        return Math.max(lo, Math.min(hi, v));
+    }
+
+    private MapScanner() {}
+}

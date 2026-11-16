@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 1,
+  "id": "wayfarers_atlas",
+  "version": "${version}",
+  "name": "Wayfarer's Atlas",
+  "description": "A cozy parchment map that lives inside your Atlas.\n\n- Minimap and full world map drawn from real block colours, with relief, water depth and biome tints\n- Cave view, day and night (torches and lava glow in the dark)\n- Markers with 100 pixel-art icons, shareable in chat\n- Every Atlas keeps its own map: lose it and the map is gone, give it to a friend and they see what you explored\n- Wayfarer's Map Table: share explored lands and markers between Atlases; places you only saw on the table stay faded until you visit them\n- Atlas pages: Creature Radar (mobs with their faces) and Death Point (a marker where you died)\n- Atlas slot: an Atlas kept there is not dropped when you die\n- Ruler, trail of the last minute, other worlds on the map\n- Teleport from the map (for operators)\n\nOpen the map with J. Settings: Mods > Wayfarer's Atlas > Config.",
+  "authors": [
+    "Vhinky"
+  ],
+  "contact": {
+    "homepage": "https://github.com/Vhinky/wayfarers-atlas",
+    "sources": "https://github.com/Vhinky/wayfarers-atlas",
+    "issues": "https://github.com/Vhinky/wayfarers-atlas/issues"
+  },
+  "license": "LGPL-3.0-only",
+  "icon": "wayfarers_atlas.png",
+  "environment": "*",
+  "entrypoints": {
+    "main": [
+      "com.wayfarersatlas.WayfarersAtlas"
+    ],
+    "client": [
+      "com.wayfarersatlas.WayfarersAtlasClient"
+    ],
+    "modmenu": [
+      "com.wayfarersatlas.platform.ModMenuHook"
+    ]
+  },
+  "mixins": [
+    "wayfarers_atlas.mixins.json"
+  ],
+  "accessWidener": "wayfarers_atlas.accesswidener",
+  "depends": {
+    "fabricloader": ">=0.16.0",
+    "minecraft": "~1.21.1",
+    "java": ">=21",
+    "fabric-api": "*"
+  },
+  "suggests": {
+    "modmenu": "*"
+  }
+}

@@ -1,0 +1,18 @@
+accessWidener v2 named
+# the Atlas slot next to the inventory
+accessible field net/minecraft/client/gui/screens/inventory/AbstractContainerScreen leftPos I
+accessible field net/minecraft/client/gui/screens/inventory/AbstractContainerScreen topPos I
+accessible field net/minecraft/client/gui/screens/inventory/AbstractContainerScreen imageWidth I
+accessible field net/minecraft/client/gui/screens/inventory/AbstractContainerScreen hoveredSlot Lnet/minecraft/world/inventory/Slot;
+# creature heads on the maps are drawn from their models
+accessible field net/minecraft/client/model/geom/ModelPart cubes Ljava/util/List;
+accessible field net/minecraft/client/model/geom/ModelPart children Ljava/util/Map;
+accessible field net/minecraft/client/model/geom/ModelPart$Cube polygons [Lnet/minecraft/client/model/geom/ModelPart$Polygon;
+accessible class net/minecraft/client/model/geom/ModelPart$Polygon
+accessible class net/minecraft/client/model/geom/ModelPart$Vertex
+accessible method net/minecraft/client/model/AgeableListModel headParts ()Ljava/lang/Iterable;
+accessible method net/minecraft/client/model/AgeableListModel bodyParts ()Ljava/lang/Iterable;
+# how far the server simulates (creature radar)
+accessible field net/minecraft/client/multiplayer/ClientPacketListener serverSimulationDistance I
+# block colours are taken from the textures
+accessible field net/minecraft/client/renderer/texture/SpriteContents originalImage Lcom/mojang/blaze3d/platform/NativeImage;

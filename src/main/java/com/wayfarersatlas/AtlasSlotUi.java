@@ -1,0 +1,146 @@
+package com.wayfarersatlas;
+
+import net.minecraft.ChatFormatting;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.GuiGraphics;
+import net.minecraft.client.gui.screens.inventory.InventoryScreen;
+import net.minecraft.network.chat.Component;
+import net.minecraft.world.item.ItemStack;
+import net.fabricmc.fabric.api.client.screen.v1.ScreenEvents;
+import net.fabricmc.fabric.api.client.screen.v1.ScreenMouseEvents;
+import net.minecraft.client.gui.screens.Screen;
+import com.wayfarersatlas.platform.PacketDistributor;
+
+import java.util.List;
+
+/** Draws the Atlas slot on the left of the survival inventory and handles clicks on it. */
+public final class AtlasSlotUi {
+    private static final ItemStack GHOST = new ItemStack(WayfarersAtlas.ATLAS.get());
+
+    /**
+     * Top-left corner of the 18x18 slot, or null if it is not shown on this screen.
+     * Right of the inventory, level with the "Crafting" title. It moves down past potion effects and past anything
+     * other mods put there (buttons, extra slots), and can be shifted in the settings.
+     */
+    private static int[] pos(Object screen) {
+        if (!(screen instanceof InventoryScreen inv)) return null;
+        int x = inv.leftPos + inv.imageWidth + 9 + AtlasConfig.SLOT_X.get();
+        int y = inv.topPos + 6 + AtlasConfig.SLOT_Y.get();
+        var mc = Minecraft.getInstance();
+        if (mc.player != null && AtlasConfig.SLOT_X.get() == 0 && AtlasConfig.SLOT_Y.get() == 0) {
+            long shown = mc.player.getActiveEffects().stream().filter(e -> e.showIcon()).count();
+            if (shown > 0) y += (int) Math.min(166, shown > 5 ? 166 : shown * 33); // effects are listed there
+        }
+        for (int tries = 0; tries < 12 && blocked(inv, x, y); tries++) y += 24; // something else is there: go down
+        return new int[]{x, y};
+    }
+
+    /** Does a button or a slot of another mod cover this place? */
+    private static boolean blocked(InventoryScreen inv, int x, int y) {
+        int x0 = x - 5, y0 = y - 5, x1 = x + 21, y1 = y + 21;
+        for (var c : inv.children()) {
+            if (c instanceof net.minecraft.client.gui.components.AbstractWidget w && w.visible) {
+                if (w.getX() < x1 && w.getX() + w.getWidth() > x0 && w.getY() < y1 && w.getY() + w.getHeight() > y0) return true;
+            }
+        }
+        for (var s : inv.getMenu().slots) {
+            int sx = inv.leftPos + s.x, sy = inv.topPos + s.y;
+            if (s.isActive() && sx < x1 && sx + 16 > x0 && sy < y1 && sy + 16 > y0) return true;
+        }
+        return false;
+    }
+
+    private static boolean pressedHere = false;
+
+    /** The inventory screen opened: draw the slot over it and take the clicks on it. */
+    public static void attach(Screen screen) {
+        ScreenEvents.afterRender(screen).register((s, g, mx, my, delta) -> onRender(s, g, mx, my));
+        ScreenMouseEvents.allowMouseClick(screen).register((s, mx, my, button) -> !onClick(s, mx, my, button));
+        ScreenMouseEvents.allowMouseRelease(screen).register((s, mx, my, button) -> !onRelease());
+    }
+
+    /** The press on our slot was handled: the release must not reach the screen (it would drop the item). */
+    private static boolean onRelease() {
+        if (pressedHere) {
+            pressedHere = false;
+            return true;
+        }
+        return false;
+    }
+
+    private static boolean over(int[] p, double mx, double my) {
+        return p != null && mx >= p[0] - 1 && mx < p[0] + 17 && my >= p[1] - 1 && my < p[1] + 17;
+    }
+
+    private static void onRender(Screen screen, GuiGraphics g, int mx, int my) {
+        int[] p = pos(screen);
+        if (p == null) return;
+        int x = p[0], y = p[1];
+        // a little parchment tab with a wooden edge, like the Atlas map; the slot pressed into the parchment
+        g.fill(x - 5, y - 5, x + 21, y + 21, Ui.DARK);
+        g.fill(x - 4, y - 4, x + 20, y + 20, Ui.BROWN);
+        g.fillGradient(x - 3, y - 3, x + 19, y + 19, Ui.PARCH_TOP, Ui.PARCH_BOT);
+        g.fill(x - 1, y - 1, x + 17, y, 0xFF6B4A26);     // shadow at the top and left
+        g.fill(x - 1, y, x, y + 17, 0xFF6B4A26);
+        g.fill(x, y + 16, x + 17, y + 17, 0xFFF3E6C4);   // light at the bottom and right
+        g.fill(x + 16, y, x + 17, y + 16, 0xFFF3E6C4);
+        g.fill(x, y, x + 16, y + 16, 0xFFB89868);         // the slot itself
+
+        ItemStack s = AtlasSlot.clientStack;
+        if (s.isEmpty()) { // faint outline of an Atlas: shows what belongs here
+            g.renderItem(GHOST, x, y);
+            g.pose().pushPose();
+            g.pose().translate(0, 0, 200);
+            g.fill(x, y, x + 16, y + 16, 0xB0B89868);
+            g.pose().popPose();
+        } else {
+            g.renderItem(s, x, y);
+            g.renderItemDecorations(Minecraft.getInstance().font, s, x, y);
+        }
+        if (over(p, mx, my)) {
+            g.pose().pushPose();
+            g.pose().translate(0, 0, 200);
+            g.fill(x, y, x + 16, y + 16, 0x80FFFFFF);
+            g.pose().popPose();
+            var mc = Minecraft.getInstance();
+            boolean carrying = mc.player != null && !mc.player.containerMenu.getCarried().isEmpty();
+            if (!carrying) {
+                if (s.isEmpty()) {
+                    g.renderComponentTooltip(mc.font, List.of(
+                            Component.translatable("screen.wayfarers_atlas.atlas_slot").withStyle(ChatFormatting.GOLD),
+                            Component.translatable("screen.wayfarers_atlas.atlas_slot.desc").withStyle(ChatFormatting.GRAY)), mx, my);
+                } else {
+                    g.renderTooltip(mc.font, s, mx, my);
+                }
+            }
+        }
+    }
+
+    /** True: the click was ours (the screen does not get it). */
+    private static boolean onClick(Screen screen, double mx, double my, int button) {
+        int[] p = pos(screen);
+        if (p == null) return false;
+        boolean shift = Screen.hasShiftDown();
+        if (over(p, mx, my)) {
+            if (button == 0 || button == 1) {
+                int action = shift ? AtlasSlot.SHIFT : button == 1 ? AtlasSlot.RIGHT : AtlasSlot.LEFT;
+                PacketDistributor.sendToServer(new Net.AtlasSlotClick(action, -1));
+                pressedHere = true;
+                return true;
+            }
+            return false;
+        }
+        // shift-click on an Atlas in the inventory: straight into the Atlas slot (if it is free)
+        if (shift && button == 0 && AtlasSlot.clientStack.isEmpty() && screen instanceof InventoryScreen inv) {
+            var slot = inv.hoveredSlot;
+            if (slot != null && slot.getItem().is(WayfarersAtlas.ATLAS.get())) {
+                PacketDistributor.sendToServer(new Net.AtlasSlotClick(AtlasSlot.SHIFT_IN, slot.index));
+                pressedHere = true;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private AtlasSlotUi() {}
+}
